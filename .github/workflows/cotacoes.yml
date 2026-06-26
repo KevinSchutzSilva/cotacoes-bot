@@ -1,0 +1,29 @@
+name: Cotações diárias
+
+on:
+  schedule:
+    # 10:15 UTC = 07:15 no horário de Brasília (Brasil é UTC-3 o ano todo, sem horário de verão).
+    # 1-5 = segunda a sexta (mercado fechado fim de semana).
+    - cron: '15 10 * * 1-5'
+  workflow_dispatch:   # botão "Run workflow" pra testar manualmente quando quiser
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar o bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
