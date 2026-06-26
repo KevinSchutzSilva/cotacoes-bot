@@ -1,38 +1,58 @@
 #!/usr/bin/env python3
 """
-Bot de cotações - envia dólar, euro, libra, dólar canadense e IBOVESPA no Telegram.
+Bot de cotações - dólar, euro, libra, dólar canadense e IBOVESPA no Telegram.
 Roda 1x por dia via GitHub Actions. Mostra cotação + variação do dia + comparação
 com a média dos últimos 30 dias (sinal objetivo, NÃO recomendação de compra).
+Fonte única: Yahoo Finance (via yfinance) — sem chave, sem cadastro.
 """
 
 import os
-import sys
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import yfinance as yf
 
-# --- Configuração -----------------------------------------------------------
-
-MOEDAS = ["USD", "EUR", "GBP", "CAD"]   # pares contra o Real (BRL)
 DIAS_MEDIA = 30
 FUSO = ZoneInfo("America/Sao_Paulo")
 
-NOMES = {
-    "USD": ("DÓLAR", "💵"),
-    "EUR": ("EURO",  "💶"),
-    "GBP": ("LIBRA", "💷"),
-    "CAD": ("CAD",   "🍁"),
-}
+# (código, ticker no Yahoo, nome, emoji)
+ATIVOS = [
+    ("USD", "USDBRL=X", "DÓLAR", "💵"),
+    ("EUR", "EURBRL=X", "EURO",  "💶"),
+    ("GBP", "GBPBRL=X", "LIBRA", "💷"),
+    ("CAD", "CADBRL=X", "CAD",   "🍁"),
+]
+IBOV_TICKER = "^BVSP"
 
-# --- Formatação de números no padrão brasileiro -----------------------------
 
 def fmt(valor, casas=2):
-    """1234.5 -> '1.234,50'  (padrão brasileiro)"""
+    """1234.5 -> '1.234,50' (padrão brasileiro)."""
     s = f"{valor:,.{casas}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
+
+def seta(pct):
+    return "▲" if pct > 0 else ("▼" if pct < 0 else "•")
+
+
+def fetch_ticker(ticker):
+    """Retorna (atual, pct_do_dia, media30) ou (None, None, None) se falhar."""
+    try:
+        hist = yf.Ticker(ticker).history(period="45d")
+        fech = hist["Close"].dropna()
+        if len(fech) < 2:
+            return None, None, None
+        atual = float(fech.iloc[-1])
+        anterior = float(fech.iloc[-2])
+        pct = (atual - anterior) / anterior * 100
+        media = float(fech.tail(DIAS_MEDIA).mean())
+        return atual, pct, media
+    except Exception as e:
+        print(f"[aviso] {ticker} indisponivel: {e}")
+        return None, None, None
+
+
 def sinal_media(atual, media):
-    """Compara o valor atual com a média de 30 dias."""
     if media is None:
         return ""
     diff = (atual - media) / media * 100
@@ -40,119 +60,59 @@ def sinal_media(atual, media):
         return f"   📉 abaixo da média de 30d (R$ {fmt(media)}) — relativamente barato"
     elif diff >= 0.5:
         return f"   📈 acima da média de 30d (R$ {fmt(media)}) — relativamente caro"
-    else:
-        return f"   ➡️ perto da média de 30d (R$ {fmt(media)})"
+    return f"   ➡️ perto da média de 30d (R$ {fmt(media)})"
 
-# --- Coleta de dados: moedas (AwesomeAPI - grátis, sem chave) ----------------
 
-def fetch_moedas():
-    """Retorna dict {codigo: {'atual':float,'pct':float,'media':float|None}}."""
-    pares = ",".join(f"{m}-BRL" for m in MOEDAS)
-    out = {}
-
-    # cotação atual de todas de uma vez
-    url = f"https://economia.awesomeapi.com.br/json/last/{pares}"
-    dados = requests.get(url, timeout=20).json()
-
-    for m in MOEDAS:
-        chave = f"{m}BRL"
-        info = dados.get(chave, {})
-        atual = float(info.get("bid")) if info.get("bid") else None
-        pct = float(info.get("pctChange")) if info.get("pctChange") else None
-
-        # histórico de 30 dias para a média
-        media = None
-        try:
-            h = requests.get(
-                f"https://economia.awesomeapi.com.br/json/daily/{m}-BRL/{DIAS_MEDIA}",
-                timeout=20,
-            ).json()
-            bids = [float(d["bid"]) for d in h if d.get("bid")]
-            if bids:
-                media = sum(bids) / len(bids)
-        except Exception as e:
-            print(f"[aviso] media {m} indisponivel: {e}")
-
-        out[m] = {"atual": atual, "pct": pct, "media": media}
-    return out
-
-# --- Coleta de dados: IBOVESPA (yfinance - grátis, sem chave) ----------------
-
-def fetch_ibovespa():
-    """Retorna {'atual':float,'pct':float,'media':float} ou None se falhar."""
-    try:
-        import yfinance as yf
-        hist = yf.Ticker("^BVSP").history(period="45d")
-        fechamentos = hist["Close"].dropna()
-        if len(fechamentos) < 2:
-            return None
-        atual = float(fechamentos.iloc[-1])
-        anterior = float(fechamentos.iloc[-2])
-        pct = (atual - anterior) / anterior * 100
-        media = float(fechamentos.tail(DIAS_MEDIA).mean())
-        return {"atual": atual, "pct": pct, "media": media}
-    except Exception as e:
-        print(f"[aviso] ibovespa indisponivel: {e}")
-        return None
-
-# --- Montagem da mensagem ----------------------------------------------------
-
-def montar_mensagem(moedas, ibov):
+def montar_mensagem():
     agora = datetime.now(FUSO)
     dias = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
-    cabecalho = f"📊 Cotações — {agora:%d/%m} ({dias[agora.weekday()]}) {agora:%H:%M}"
-    linhas = [cabecalho, ""]
+    linhas = [f"📊 Cotações — {agora:%d/%m} ({dias[agora.weekday()]}) {agora:%H:%M}", ""]
 
-    for m in MOEDAS:
-        d = moedas.get(m, {})
-        nome, emoji = NOMES[m]
-        if d.get("atual") is None:
-            linhas.append(f"{emoji} {nome}: dados indisponíveis")
-            linhas.append("")
+    for _, ticker, nome, emoji in ATIVOS:
+        atual, pct, media = fetch_ticker(ticker)
+        if atual is None:
+            linhas += [f"{emoji} {nome}: dados indisponíveis", ""]
             continue
-        pct = d.get("pct")
-        seta = "▲" if (pct or 0) > 0 else ("▼" if (pct or 0) < 0 else "•")
-        pct_txt = f"{seta} {fmt(abs(pct or 0),1)}% hoje" if pct is not None else ""
-        linhas.append(f"{emoji} {nome}  R$ {fmt(d['atual'])}  ({pct_txt})")
-        s = sinal_media(d["atual"], d.get("media"))
+        linhas.append(f"{emoji} {nome}  R$ {fmt(atual)}  ({seta(pct)} {fmt(abs(pct),1)}% hoje)")
+        s = sinal_media(atual, media)
         if s:
             linhas.append(s)
         linhas.append("")
 
-    if ibov:
-        seta = "▲" if ibov["pct"] > 0 else ("▼" if ibov["pct"] < 0 else "•")
-        linhas.append(f"📈 IBOVESPA  {fmt(ibov['atual'],0)} pts  ({seta} {fmt(abs(ibov['pct']),1)}% hoje)")
-        if ibov["atual"] < ibov["media"]:
-            linhas.append(f"   📉 abaixo da média de 30d ({fmt(ibov['media'],0)} pts)")
-        else:
-            linhas.append(f"   📈 acima da média de 30d ({fmt(ibov['media'],0)} pts)")
-        linhas.append("")
+    atual, pct, media = fetch_ticker(IBOV_TICKER)
+    if atual is None:
+        linhas += ["📈 IBOVESPA: dados indisponíveis", ""]
     else:
-        linhas.append("📈 IBOVESPA: dados indisponíveis")
+        linhas.append(f"📈 IBOVESPA  {fmt(atual,0)} pts  ({seta(pct)} {fmt(abs(pct),1)}% hoje)")
+        if media is not None:
+            if atual < media:
+                linhas.append(f"   📉 abaixo da média de 30d ({fmt(media,0)} pts)")
+            else:
+                linhas.append(f"   📈 acima da média de 30d ({fmt(media,0)} pts)")
         linhas.append("")
 
     linhas.append("⚠️ Isto é informação, não recomendação. Ninguém prevê o curto prazo — você decide.")
     return "\n".join(linhas)
 
-# --- Envio pelo Telegram -----------------------------------------------------
 
 def enviar_telegram(texto):
     token = os.environ["TELEGRAM_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(url, json={"chat_id": chat_id, "text": texto}, timeout=20)
+    if not r.ok:
+        # mostra o motivo EXATO do Telegram no log (ajuda a diagnosticar)
+        print("ERRO do Telegram:", r.status_code, "->", r.text)
     r.raise_for_status()
     print("Mensagem enviada com sucesso.")
 
-# --- Main --------------------------------------------------------------------
 
 def main():
-    moedas = fetch_moedas()
-    ibov = fetch_ibovespa()
-    texto = montar_mensagem(moedas, ibov)
+    texto = montar_mensagem()
     print(texto)
     print("-" * 40)
     enviar_telegram(texto)
+
 
 if __name__ == "__main__":
     main()
